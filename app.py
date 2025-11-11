@@ -85,4 +85,30 @@ def build_index():
         for part in chunk(text):
             docs.append(part)
             metas.append({"url": url})
-    if no
+    if not docs:
+        return {"status": "Aucune page trouvée"}
+    embeddings = embed_texts(docs)
+    ids = [str(i) for i in range(len(docs))]
+    collection.add(documents=docs, metadatas=metas, embeddings=embeddings, ids=ids)
+    print(f"✅ {len(docs)} passages indexés depuis technopure.ma")
+    return {"status": f"{len(docs)} passages indexés"}
+
+# ❌ Ne pas appeler build_index ici (trop lourd pour Render)
+# build_index()
+
+# ✅ Route manuelle pour reindexer
+@app.get("/reindex")
+def reindex():
+    """Reconstruit l'index manuellement depuis technopure.ma"""
+    return build_index()
+
+@app.post("/chat")
+def chat(payload: dict = Body(...)):
+    q = (payload.get("question") or "").strip()
+    if not q:
+        return {
+            "answer": "Posez votre question sur le contenu de technopure.ma.",
+            "sources": [],
+        }
+    passages = retrieve(q)
+    return generate_answer(q, passages)
