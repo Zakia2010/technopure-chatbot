@@ -11,12 +11,14 @@ from openai import OpenAI
 BASE = "https://www.technopure.ma/"
 ALLOWED_NETLOC = urlparse(BASE).netloc.replace("www.", "")
 
-# ✅ FastAPI doit être créé AVANT toute route
-app = FastAPI(title="Technopure Site-only Chat")
+app = FastAPI(title="Technopure Site Chatbot")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://www.technopure.ma", "https://technopure.ma", "*"],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------- OpenAI + Chroma ----------
@@ -93,22 +95,49 @@ def build_index():
     print(f"✅ {len(docs)} passages indexés depuis technopure.ma")
     return {"status": f"{len(docs)} passages indexés"}
 
-# ❌ Ne pas appeler build_index ici (trop lourd pour Render)
-# build_index()
-
-# ✅ Route manuelle pour reindexer
-@app.get("/reindex")
+@app.api_route("/reindex", methods=["GET", "POST"])
 def reindex():
-    """Reconstruit l'index manuellement depuis technopure.ma"""
+    """Reconstruit manuellement l'index à partir du site Technopure"""
     return build_index()
+
+# ---------- Recherche et génération ----------
+SYSTEM_PROMPT = (
+    "Tu es l'assistant Technopure. Réponds UNIQUEMENT avec les informations "
+    "du contexte (extraits de technopure.ma). Si tu ne sais pas, dis-le simplement."
+)
+
+def retrieve(query: str, k=5):
+    q_emb = embed_texts([query])[0]
+    results = collection.query(query_embeddings=[q_emb], n_results=k)
+    passages = []
+    for text, meta, dist in zip(
+        results["documents"][0], results["metadatas"][0], results["distances"][0]
+    ):
+        passages.append({"text": text, "url": meta["url"], "score": 1 - dist})
+    return passages
+
+def generate_answer(query, passages):
+    if not passages:
+        return {
+            "answer": "Désolé, je ne trouve pas cette information sur technopure.ma.",
+            "sources": [],
+        }
+    context = "\n\n".join([f"[{p['url']}]\n{p['text']}" for p in passages])
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Question: {query}\n\nContexte:\n{context}\n\nRéponds en français et cite les URLs."},
+    ]
+    rsp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.2)
+    return {"answer": rsp.choices[0].message.content, "sources": list({p["url"] for p in passages})}
 
 @app.post("/chat")
 def chat(payload: dict = Body(...)):
     q = (payload.get("question") or "").strip()
     if not q:
-        return {
-            "answer": "Posez votre question sur le contenu de technopure.ma.",
-            "sources": [],
-        }
+        return {"answer": "Posez votre question sur le contenu de technopure.ma.", "sources": []}
     passages = retrieve(q)
     return generate_answer(q, passages)
+
+@app.get("/")
+def home():
+    return {"status": "✅ Technopure Chatbot API is running", "endpoints": ["/reindex", "/chat"]}
