@@ -23,9 +23,9 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 chroma_client = chromadb.Client()
 collection = chroma_client.create_collection("technopure")
 
-# Utilisation des embeddings OpenAI (léger et cloud)
+# ---------- Fonction d’embedding via API OpenAI ----------
 def embed_texts(texts):
-    """Crée les embeddings via l'API OpenAI (pas de modèle local)"""
+    """Crée les embeddings via l'API OpenAI (léger et cloud)"""
     res = client.embeddings.create(model="text-embedding-3-small", input=texts)
     return [r.embedding for r in res.data]
 
@@ -94,16 +94,54 @@ def build_index():
 
 build_index()
 
+# ---------- Chatbot ----------
 SYSTEM_PROMPT = (
     "Tu es l'assistant Technopure. Réponds UNIQUEMENT avec les informations "
     "du contexte (extraits de technopure.ma). Sinon dis que tu ne l'as pas."
 )
 
 def retrieve(query: str, k=5):
+    """Recherche les passages les plus similaires dans Chroma"""
     q_emb = embed_texts([query])[0]
     results = collection.query(query_embeddings=[q_emb], n_results=k)
     passages = []
     for text, meta, dist in zip(
         results["documents"][0], results["metadatas"][0], results["distances"][0]
     ):
-        passages
+        passages.append({"text": text, "url": meta["url"], "score": 1 - dist})
+    return passages
+
+def generate_answer(query, passages):
+    """Génère la réponse avec le contexte fourni"""
+    if not passages:
+        return {
+            "answer": "Désolé, je ne trouve pas cette information sur technopure.ma.",
+            "sources": [],
+        }
+    context = "\n\n".join([f"[{p['url']}]\n{p['text']}" for p in passages])
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": f"Question: {query}\n\nContexte:\n{context}\n\nRéponds en français et cite les URLs.",
+        },
+    ]
+    rsp = client.chat.completions.create(
+        model="gpt-4o-mini", messages=messages, temperature=0.2
+    )
+    return {
+        "answer": rsp.choices[0].message.content,
+        "sources": list({p["url"] for p in passages}),
+    }
+
+@app.post("/chat")
+def chat(payload: dict = Body(...)):
+    """Endpoint principal du chatbot"""
+    q = (payload.get("question") or "").strip()
+    if not q:
+        return {
+            "answer": "Posez votre question sur le contenu de technopure.ma.",
+            "sources": [],
+        }
+    passages = retrieve(q)
+    return generate_answer(q, passages)
