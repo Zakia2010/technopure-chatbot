@@ -4,7 +4,6 @@ import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
-from sentence_transformers import SentenceTransformer
 import chromadb
 from openai import OpenAI
 
@@ -19,16 +18,18 @@ app.add_middleware(
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# Embeddings + OpenAI
-# ✅ Version plus légère pour Render (évite l'erreur Out Of Memory)
-model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
-
+# ---------- OpenAI + Chroma ----------
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Base Chroma (remplace FAISS)
 chroma_client = chromadb.Client()
 collection = chroma_client.create_collection("technopure")
 
+# Utilisation des embeddings OpenAI (léger et cloud)
+def embed_texts(texts):
+    """Crée les embeddings via l'API OpenAI (pas de modèle local)"""
+    res = client.embeddings.create(model="text-embedding-3-small", input=texts)
+    return [r.embedding for r in res.data]
+
+# ---------- Extraction du contenu du site ----------
 def clean_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script","style","noscript","header","footer","form","nav","aside"]):
@@ -76,7 +77,7 @@ def crawl(start=BASE, limit=300):
             continue
     return pages
 
-# ----------- Indexation ----------
+# ---------- Construction de l'index ----------
 def build_index():
     pages = crawl()
     docs, metas = [], []
@@ -86,7 +87,7 @@ def build_index():
             metas.append({"url": url})
     if not docs:
         return
-    embeddings = model.encode(docs).tolist()
+    embeddings = embed_texts(docs)
     ids = [str(i) for i in range(len(docs))]
     collection.add(documents=docs, metadatas=metas, embeddings=embeddings, ids=ids)
     print(f"✅ {len(docs)} passages indexés depuis technopure.ma")
@@ -99,44 +100,10 @@ SYSTEM_PROMPT = (
 )
 
 def retrieve(query: str, k=5):
-    query_emb = model.encode([query]).tolist()[0]
-    results = collection.query(query_embeddings=[query_emb], n_results=k)
+    q_emb = embed_texts([query])[0]
+    results = collection.query(query_embeddings=[q_emb], n_results=k)
     passages = []
     for text, meta, dist in zip(
         results["documents"][0], results["metadatas"][0], results["distances"][0]
     ):
-        passages.append({"text": text, "url": meta["url"], "score": 1 - dist})
-    return passages
-
-def generate_answer(query, passages):
-    if not passages:
-        return {
-            "answer": "Désolé, je ne trouve pas cette information sur technopure.ma.",
-            "sources": [],
-        }
-    context = "\n\n".join([f"[{p['url']}]\n{p['text']}" for p in passages])
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": f"Question: {query}\n\nContexte:\n{context}\n\nRéponds en français et cite les URLs.",
-        },
-    ]
-    rsp = client.chat.completions.create(
-        model="gpt-4o-mini", messages=messages, temperature=0.2
-    )
-    return {
-        "answer": rsp.choices[0].message.content,
-        "sources": list({p["url"] for p in passages}),
-    }
-
-@app.post("/chat")
-def chat(payload: dict = Body(...)):
-    q = (payload.get("question") or "").strip()
-    if not q:
-        return {
-            "answer": "Posez votre question sur le contenu de technopure.ma.",
-            "sources": [],
-        }
-    passages = retrieve(q)
-    return generate_answer(q, passages)
+        passages
