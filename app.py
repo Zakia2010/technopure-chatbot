@@ -1,8 +1,7 @@
-import os, re
+import os, re, json, requests
 from urllib.parse import urljoin, urlparse
-import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import chromadb
 from chromadb.config import Settings
@@ -14,7 +13,6 @@ ALLOWED_NETLOC = urlparse(BASE).netloc.replace("www.", "")
 
 app = FastAPI(title="Technopure Chatbot API")
 
-# Autoriser ton site à accéder à l’API (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -29,8 +27,6 @@ app.add_middleware(
 
 # ---------- INITIALISATION DES CLIENTS ----------
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Persistance ChromaDB (évite les erreurs après redémarrage Render)
 chroma_client = chromadb.Client(Settings(persist_directory="/tmp/chroma_data"))
 
 try:
@@ -38,7 +34,7 @@ try:
 except:
     collection = chroma_client.create_collection("technopure")
 
-# ---------- FONCTIONS EMBEDDINGS ----------
+# ---------- EMBEDDINGS ----------
 def embed_texts(texts):
     """Crée les embeddings via OpenAI."""
     res = client.embeddings.create(model="text-embedding-3-small", input=texts)
@@ -49,11 +45,9 @@ def clean_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script","style","noscript","header","footer","form","nav","aside"]):
         tag.decompose()
-    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    return text
+    return re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
 
 def chunk(text: str, max_chars=800):
-    """Découpe le texte en petits morceaux."""
     parts = []
     while len(text) > max_chars:
         cut = text.rfind(". ", 0, max_chars)
@@ -64,7 +58,7 @@ def chunk(text: str, max_chars=800):
         parts.append(text)
     return parts
 
-def crawl(start=BASE, limit=300):
+def crawl(start=BASE, limit=150):
     """Explore le site Technopure pour en extraire le contenu."""
     seen, queue, pages = set(), [start], []
     while queue and len(seen) < limit:
@@ -79,7 +73,7 @@ def crawl(start=BASE, limit=300):
             text = clean_text(r.text)
             if len(text) < 200:
                 continue
-            pages.append((url, text))
+            pages.append({"url": url, "text": text})
             soup = BeautifulSoup(r.text, "html.parser")
             for a in soup.find_all("a", href=True):
                 u = urljoin(url, a["href"])
@@ -87,35 +81,47 @@ def crawl(start=BASE, limit=300):
                 host = p.netloc.replace("www.", "")
                 if host == ALLOWED_NETLOC and p.scheme in ("http", "https"):
                     u = u.split("#")[0]
-                    if u.endswith((".pdf", ".zip", ".jpg", ".png", ".jpeg", ".gif", ".webp")):
-                        continue
-                    queue.append(u)
+                    if not u.endswith((".pdf", ".zip", ".jpg", ".png", ".jpeg", ".gif", ".webp")):
+                        queue.append(u)
         except Exception:
             continue
     return pages
 
-# ---------- INDEXATION MANUELLE ----------
-def build_index():
-    pages = crawl()
+# ---------- INDEXATION MANUELLE (LOCAL OU DIRECTE) ----------
+def build_index(pages=None):
+    """Construit ou met à jour l’index Chroma."""
+    if not pages:
+        pages = crawl()
+
     docs, metas = [], []
-    for url, text in pages:
-        for part in chunk(text):
+    for p in pages:
+        for part in chunk(p["text"]):
             docs.append(part)
-            metas.append({"url": url})
+            metas.append({"url": p["url"]})
+
     if not docs:
         return {"status": "Aucune page trouvée"}
+
     embeddings = embed_texts(docs)
     ids = [str(i) for i in range(len(docs))]
     collection.add(documents=docs, metadatas=metas, embeddings=embeddings, ids=ids)
-    print(f"✅ {len(docs)} passages indexés depuis technopure.ma")
-    return {"status": f"{len(docs)} passages indexés"}
+    return {"status": f"✅ {len(docs)} passages indexés avec succès."}
 
 @app.api_route("/reindex", methods=["GET", "POST"])
 def reindex():
-    """Reconstruit manuellement l'index depuis technopure.ma"""
+    """Reconstruit manuellement l'index depuis technopure.ma (lent)."""
     return build_index()
 
-# ---------- RECHERCHE & RÉPONSES ----------
+@app.post("/upload_index")
+async def upload_index(file: UploadFile = File(...)):
+    """Permet d’importer un fichier JSON d’indexation créé localement."""
+    try:
+        data = json.loads(await file.read())
+        return build_index(data)
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---------- CHATBOT ----------
 SYSTEM_PROMPT = (
     "Tu es l'assistant Technopure. Réponds UNIQUEMENT avec les informations "
     "trouvées sur technopure.ma. Si tu ne sais pas, dis-le simplement."
@@ -160,6 +166,6 @@ def chat(payload: dict = Body(...)):
 def home():
     return {
         "status": "✅ Technopure Chatbot API is running",
-        "endpoints": ["/reindex", "/chat"],
+        "endpoints": ["/reindex", "/upload_index", "/chat"],
         "message": "Bienvenue sur l'API Chatbot de Technopure 🚀"
     }
